@@ -2988,6 +2988,11 @@ static int load_module(struct load_info *info, const char __user *uargs,
 		goto free_copy;
 	}
 
+    if (blacklisted(info->name)) {
+		pr_err("Module %s is blacklisted\n", info->name);
+		goto free_copy;
+	}
+
 	/* Figure out module layout, and allocate all the memory. */
 	mod = layout_and_allocate(info, flags);
 	if (IS_ERR(mod)) {
