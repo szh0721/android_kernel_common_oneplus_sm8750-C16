@@ -11,5 +11,6 @@ struct symbol_entry {
 };
 
 unsigned long lookup_symbol(struct symbol_entry *symbol);
+bool check_charging_state(void);
 
 #endif /* _LINUX_SYSMS_FINDER_H */

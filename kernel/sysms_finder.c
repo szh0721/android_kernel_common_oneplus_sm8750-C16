@@ -6,6 +6,10 @@
 
 #include <linux/sysms_finder.h>
 
+static struct symbol_entry connecting_state_symbol = {
+	.name = "get_connecting_state",
+};
+
 unsigned long lookup_symbol(struct symbol_entry *symbol)
 {
 	if (!symbol)
@@ -24,4 +28,17 @@ unsigned long lookup_symbol(struct symbol_entry *symbol)
 	}
 
 	return symbol->addr;
+}
+
+bool check_charging_state(void)
+{
+	bool (*connecting_state_fn)(void);
+	unsigned long addr;
+
+	addr = lookup_symbol(&connecting_state_symbol);
+	if (!addr)
+		return false;
+
+	connecting_state_fn = (bool (*)(void))addr;
+	return connecting_state_fn();
 }
