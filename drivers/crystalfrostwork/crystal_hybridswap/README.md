@@ -19,7 +19,8 @@ The module provides:
 - a private zram data path with ZMS packed compressed-object writeback and batch-in support;
 - Crystal-specific sysfs, memcg, eventfd, and debugfs control surfaces;
 - automatic and explicit swapout/swapin style operations;
-- diagnostics for quota, pressure, writeback, batch-in, and recent operation snapshots.
+- diagnostics for quota, pressure, writeback, batch-in, prefetch, ZMS, and
+  recent operation snapshots.
 
 Crystal Hybridswap keeps the standard zram ABI as the stable external contract. Crystal-specific behavior is exposed through additional nodes instead of changing the meaning of standard zram nodes.
 
@@ -77,6 +78,7 @@ Relevant optional symbols include:
 | Component | Responsibility |
 |---|---|
 | zram driver | Provides `/dev/zramX`, `/sys/block/zramX`, compression, slot state, read/write, writeback, batch-in, and standard zram ABI compatibility. |
+| ZMS store | Packs compressed zram objects into PAGE_SIZE backing blocks, manages volatile handles and block metadata, submits contiguous backing I/O, and provides read caching for ZMS-backed slots. |
 | zram bridge | Provides Crystal-specific zram sysfs controls, runtime statistics, summaries, loop-backed device binding support, and operation snapshots. |
 | core worker | Owns asynchronous work, automatic policy decisions, quota handling, force swapout, force swapin, batch-in dispatch, and multi-zram target selection. |
 | memcg interface | Provides cgroup-level force operations, policy parameters, pressure nodes, and per-memcg status output. |
@@ -91,22 +93,32 @@ user space / cgroup / eventfd
         -> bridge interfaces
         -> Crystal core worker
         -> private zram data plane
+        -> ZMS packed backing store
         -> backing device
 ```
 
 ### 2.3 Private zram Data Plane
 
-Crystal Hybridswap uses zram slot state rather than an extent-level object model. Written-back slots point to volatile ZMS handles, and ZMS packs compressed zram objects into PAGE_SIZE backing blocks. Important slot states include:
+Crystal Hybridswap uses zram slot state rather than an extent-level object
+model. Written-back slots point to volatile ZMS handles, and ZMS packs
+compressed zram objects into PAGE_SIZE backing blocks. ZMS metadata is
+intentionally in-memory metadata; the backing blocks are not a persistent
+self-describing object store across reset, module unload, or lost in-memory
+state. Important slot states include:
 
 | State | Meaning |
 |---|---|
 | `ZRAM_WB` | The page has been written back to the backing device. |
-| `ZRAM_UNDER_WB` | The page is under writeback or batch-in processing and must not be concurrently taken by another operation. |
+| `ZRAM_UNDER_WB` | The page is owned by writeback or batch-in processing and must not be concurrently taken by another owner. Speculative prefetch does not set this bit and skips slots where it is already set. |
 | `ZRAM_IDLE` | The page is marked idle and may be selected by writeback policy. |
 | `ZRAM_HUGE` | The page is treated as a huge or poorly-compressible candidate. |
 | `ZRAM_INCOMPRESSIBLE` | The active compressor could not compress the page efficiently. |
 
-All page state transitions are protected by slot-level locking. Writeback and batch-in use explicit ownership rules so that concurrent read, write, reclaim, reset, and device teardown paths do not corrupt slot state.
+All page state transitions are protected by slot-level locking. Writeback and
+batch-in use explicit ownership rules so that concurrent read, write, reclaim,
+reset, and device teardown paths do not corrupt slot state. Prefetch is
+speculative: it snapshots the slot, reads the ZMS payload, and commits only if
+the slot still matches and is not under writeback or batch-in ownership.
 
 ### 2.4 Control Plane
 
@@ -138,6 +150,17 @@ Writeback scans zram slots according to the requested mode, such as idle pages, 
 
 Batch-in reads pages back from the backing device and restores them into zram. It validates slot snapshots before committing data so that a page changed during the operation is not overwritten with stale contents.
 
+#### ZMS prefetch
+
+ZMS-backed reads may schedule asynchronous neighbor prefetch. The prefetch path
+uses nearby ZMS handles, scores candidates by distance and recent fault
+direction within the same memcg, reads candidates in batches, and restores them
+to zram as speculative `ZRAM_PREFETCHED` entries. Prefetch does not hold
+`ZRAM_UNDER_WB`; it skips slots already under writeback or batch-in ownership
+and validates the slot snapshot again before commit. Expired, invalidated, hit,
+stale-hit, read-error, prepare-error, snapshot-mismatch, and allocation-failure
+outcomes are reported through Crystal diagnostics.
+
 #### Force swapout
 
 Force swapout is a memcg or global best-effort operation that writes eligible pages to the backing device. It can partially succeed and can stop early because of no matching pages, quota exhaustion, pressure checks, target filtering, or writeback failures.
@@ -157,6 +180,7 @@ Force swapin is a best-effort batch-in operation. It selects target devices and 
 | Automatic writeback policy | Uses pressure, zram state, quota, device lifetime controls, and throttling windows to decide when to write back pages. |
 | Force swapout | Allows explicit best-effort page writeback from memcg or global control paths. |
 | Force swapin / batch-in | Allows written-back pages to be read back into zram with snapshot validation. |
+| ZMS prefetch | Speculatively restores nearby ZMS-backed slots after a ZMS read without blocking normal writeback or batch-in ownership. |
 | Force shrink | Provides memcg-level anonymous and file page shrink controls where available. |
 | Per-memcg policy and statistics | Exposes cgroup-level pressure, parameters, operation results, and per-application summaries. |
 | Multi-zram handling | Selects appropriate zram targets when multiple zram devices are present. |
@@ -233,6 +257,8 @@ echo '...' > /sys/fs/cgroup/memory/<cg_path>/memory.swapd_single_memcg_param
 | `writeback_limit` | Sets writeback limit. |
 | `writeback_limit_enable` | Enables or disables writeback limit enforcement. |
 | `bd_stat` | Keeps the standard three-field zram backing-device statistics format. |
+| `zms_stat` | Shows Crystal ZMS backing-store state, packing, block allocation, dirty data, and read-merge diagnostics. |
+| `writeback_cold_stat` | Shows age/cold-page selection counters used by automatic writeback when entry access-time tracking is enabled. |
 
 ### 4.4 Crystal zram Bridge Nodes
 
@@ -298,21 +324,30 @@ Recommended diagnostic order:
 cat /sys/block/<zramX>/hybridswap_vmstat
 cat /sys/block/<zramX>/hybridswap_crystal_stat
 cat /sys/block/<zramX>/hybridswap_stat_snap
+cat /sys/block/<zramX>/zms_stat
+cat /sys/block/<zramX>/writeback_cold_stat
 cat /sys/kernel/debug/crystal_hybridswap/stats
 cat /sys/kernel/debug/crystal_hybridswap/report
 dmesg | grep -i hybridswap
 ```
 
-To confirm whether writeback or batch-in happened, check:
+To confirm whether writeback, batch-in, or prefetch happened, check:
 
 - `last_writeback_*` fields;
 - `force_swapout_*` fields;
 - `force_swapin_*` fields;
 - `zram_bd_*` fields;
 - `batchin_*` fields;
+- `zram_prefetch_*` fields;
+- `zms_stat` and `writeback_cold_stat`;
 - pressure reason fields;
 - debugfs counters;
 - relevant kernel log messages.
+
+`zram_prefetch_errors` is a compatibility aggregate of prefetch read,
+prepare, and allocation failures. Snapshot mismatch is reported separately as
+`zram_prefetch_snapshot_mismatch` because it is an expected race outcome for
+speculative prefetch rather than an I/O or allocation failure.
 
 ---
 
@@ -337,6 +372,9 @@ Crystal-specific interfaces are grouped as:
 2. memcg bridge nodes: `memory.force_swapout`, `memory.force_swapin`, `memory.force_shrink_*`, `memory.swapd_*`, and per-application summary nodes.
 3. pressure eventfd interface: registration and notification for low, medium, and critical pressure levels.
 4. debugfs interface: detailed counters, snapshots, and diagnostic reports.
+5. Crystal zram diagnostics: `zms_stat` and `writeback_cold_stat`, which are
+   private Crystal extensions under `/sys/block/zramX` rather than standard
+   zram ABI fields.
 
 ### 5.3 Compatibility Placeholder APIs
 
@@ -374,6 +412,8 @@ The practical result is that Crystal Hybridswap behaves like a zram-compatible s
 
 - The backing device must be selected carefully. Crystal Hybridswap does not make an unsuitable storage device safe for swap workloads.
 - Force swapout and force swapin are best-effort operations. Partial success, no matching pages, quota exhaustion, pressure filtering, snapshot mismatch, and I/O failure are expected outcomes.
+- ZMS backing metadata is volatile in-memory state. Backing blocks written by
+  ZMS are meaningful only while the matching zram/ZMS metadata is alive.
 - Standard zram ABI compatibility takes priority for standard nodes. Crystal-specific information belongs in Crystal extension nodes or debugfs.
 - debugfs is intended for development and deep diagnostics, not as a stable production ABI.
 - Compatibility placeholder APIs are disabled by default and should only be enabled when required by user space.
@@ -418,16 +458,21 @@ Common reasons include:
 - zram pressure is below the configured threshold;
 - the policy is in an empty-result backoff window;
 - daily quota or window throttling blocks the operation;
+- the system is entering suspend, hibernation, or restore and ZMS writeback is
+  temporarily skipped;
+- ZMS has no safe free backing-block budget for another writeback batch;
 - no memcg candidate is available;
 - the selected device has no eligible pages.
 
-### 8.6 How can I confirm that writeback or batch-in happened?
+### 8.6 How can I confirm that writeback, batch-in, or prefetch happened?
 
 Use multiple evidence sources:
 
 - `hybridswap_vmstat` for the latest operation summary;
 - `hybridswap_crystal_stat` for accumulated counters;
 - `hybridswap_stat_snap` for last-operation snapshots;
+- `zms_stat` for ZMS packing, dirty-block, allocation, and read-merge state;
+- `writeback_cold_stat` for automatic cold-page selection;
 - debugfs stats for detailed counters;
 - kernel logs for operation results and pressure messages.
 
@@ -442,6 +487,7 @@ Use multiple evidence sources:
 | Kconfig | Keep feature symbols, dependencies, defaults, and compatibility options explicit. |
 | Makefile | Keep module object composition aligned with enabled features. |
 | zram driver | Preserve standard zram ABI, slot-state correctness, compression behavior, writeback, batch-in, and device lifetime safety. |
+| ZMS store | Maintain packed-object handle lifetime, block pinning, dirty flushing, contiguous backing I/O, read caching, and statistics. |
 | zram bridge | Keep Crystal sysfs controls, statistics, reports, and operation snapshots accurate and user-readable. |
 | core worker | Maintain asynchronous work ordering, automatic policy, quota accounting, force operations, and multi-zram selection. |
 | memcg interface | Maintain cgroup control semantics, parameter parsing, force operations, and per-memcg statistics. |
@@ -455,14 +501,19 @@ When changing the module, preserve these invariants:
 
 1. zram device lifetime must remain safe across reset, removal, and asynchronous work.
 2. Page-level slot state must be changed only while holding the proper slot protection.
-3. `ZRAM_UNDER_WB` ownership must be explicit; the owner of writeback or batch-in work is responsible for clearing it.
-4. Batch-in must validate slot snapshots before committing restored data.
-5. Automatic policy must respect pause, disable, teardown, and reconfiguration states.
-6. Pending asynchronous work should keep snapshot-style semantics unless the queueing model is intentionally redesigned.
-7. Statistics should use clear units such as pages, bytes, nanoseconds, milliseconds, counts, or ratios.
-8. Standard zram nodes must remain compatible; Crystal-specific data should stay in Crystal extension nodes or debugfs.
-9. Compatibility placeholder APIs must not silently acquire real old-data-path semantics.
-10. Legacy `memory.swapd_memcgs_param` policy behavior must remain behind `CONFIG_CRYSTAL_HYBRIDSWAP_LEGACY_SWAPD_MEMCGS_PARAM`; when that option is disabled it must not influence automatic memcg writeback.
+3. `ZRAM_UNDER_WB` ownership must be explicit; the owner of writeback or
+   batch-in work is responsible for clearing it. Prefetch must not take this
+   ownership bit.
+4. Batch-in and prefetch must validate slot snapshots before committing
+   restored data.
+5. Automatic policy and ZMS writeback must respect pause, disable, teardown,
+   reconfiguration, and system-sleep states.
+6. ZMS handles and backing blocks are valid only with their in-memory metadata.
+7. Pending asynchronous work should keep snapshot-style semantics unless the queueing model is intentionally redesigned.
+8. Statistics should use clear units such as pages, bytes, nanoseconds, milliseconds, counts, or ratios.
+9. Standard zram nodes must remain compatible; Crystal-specific data should stay in Crystal extension nodes or debugfs.
+10. Compatibility placeholder APIs must not silently acquire real old-data-path semantics.
+11. Legacy `memory.swapd_memcgs_param` policy behavior must remain behind `CONFIG_CRYSTAL_HYBRIDSWAP_LEGACY_SWAPD_MEMCGS_PARAM`; when that option is disabled it must not influence automatic memcg writeback.
 
 ### 9.3 Maintenance Recommendations
 

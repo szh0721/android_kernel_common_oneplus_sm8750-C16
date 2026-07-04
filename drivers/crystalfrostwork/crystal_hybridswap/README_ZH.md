@@ -19,7 +19,7 @@ Crystal Hybridswap 面向内存压力场景，适合希望继续使用标准 zra
 - 带 ZMS 压缩对象打包写回和 batch-in 能力的私有 zram 数据面；
 - Crystal 扩展的 sysfs、memcg、eventfd 和 debugfs 控制接口；
 - 自动和显式的 swapout / swapin 风格操作；
-- quota、压力、写回、batch-in 和最近操作快照等诊断信息。
+- quota、压力、写回、batch-in、prefetch、ZMS 和最近操作快照等诊断信息。
 
 Crystal Hybridswap 将标准 zram ABI 作为稳定外部契约。Crystal 专属行为通过新增节点暴露，而不是改变标准 zram 节点语义。
 
@@ -77,6 +77,7 @@ Crystal 因此保留有利于部署和维护的用户可见部分，但重写内
 | 组件 | 职责 |
 |---|---|
 | zram driver | 提供 `/dev/zramX`、`/sys/block/zramX`、压缩、slot 状态、读写、写回、batch-in 和标准 zram ABI 兼容性。 |
+| ZMS store | 将压缩后的 zram 对象打包到 PAGE_SIZE backing block，管理易失 handle 和 block 元数据，提交连续 backing I/O，并为 ZMS-backed slot 提供读缓存。 |
 | zram bridge | 提供 Crystal 专属 zram sysfs 控制、运行统计、摘要报告、loop-backed 设备绑定支持和操作快照。 |
 | core worker | 管理异步工作、自动策略、quota、force swapout、force swapin、batch-in 调度和多 zram 目标选择。 |
 | memcg interface | 提供 cgroup 级 force 操作、策略参数、压力节点和 per-memcg 状态输出。 |
@@ -91,22 +92,29 @@ user space / cgroup / eventfd
         -> bridge interfaces
         -> Crystal core worker
         -> private zram data plane
+        -> ZMS packed backing store
         -> backing device
 ```
 
 ### 2.3 私有 zram 数据面
 
-Crystal Hybridswap 使用 zram slot 状态，而不是 extent 级对象模型。写回 slot 指向内存中的 ZMS handle，ZMS 将压缩后的 zram 对象打包进 PAGE_SIZE backing block。重要状态包括：
+Crystal Hybridswap 使用 zram slot 状态，而不是 extent 级对象模型。写回 slot
+指向内存中的 ZMS handle，ZMS 将压缩后的 zram 对象打包进 PAGE_SIZE backing
+block。ZMS 元数据有意保持为内存中的易失元数据；reset、模块卸载或内存元数据
+丢失后，backing block 本身不是可持久解析的自描述对象存储。重要状态包括：
 
 | 状态 | 含义 |
 |---|---|
 | `ZRAM_WB` | 页面压缩对象已经由 ZMS 写回到 backing device。 |
-| `ZRAM_UNDER_WB` | 页面正在写回或 batch-in，不能被其他操作并发接管。 |
+| `ZRAM_UNDER_WB` | 页面正被 writeback 或 batch-in 拥有，不能被其他所有者并发接管。投机 prefetch 不设置该 bit，并会跳过已经设置该 bit 的 slot。 |
 | `ZRAM_IDLE` | 页面被标记为 idle，可被写回策略选中。 |
 | `ZRAM_HUGE` | 页面被视为 huge 或难压缩候选。 |
 | `ZRAM_INCOMPRESSIBLE` | 当前压缩器无法有效压缩该页面。 |
 
-所有页状态迁移都受 slot 级锁保护。写回和 batch-in 使用显式所有权规则，避免读、写、回收、reset 和设备移除路径并发破坏 slot 状态。
+所有页状态迁移都受 slot 级锁保护。写回和 batch-in 使用显式所有权规则，避免
+读、写、回收、reset 和设备移除路径并发破坏 slot 状态。Prefetch 是投机操作：
+它先记录 slot 快照，读取 ZMS payload，然后只在 slot 仍然匹配且没有处于
+writeback 或 batch-in 所有权时提交。
 
 ### 2.4 控制面
 
@@ -138,6 +146,15 @@ writeback 会按请求模式扫描 zram slot，例如 idle pages、huge pages、
 
 batch-in 会从 backing device 读回页面并恢复到 zram。提交前会校验 slot 快照，避免操作期间已经变化的页面被旧数据覆盖。
 
+#### ZMS prefetch
+
+ZMS-backed 读路径可能调度异步邻居 prefetch。prefetch 会基于附近的
+ZMS handle，按距离和同一 memcg 内最近 fault 方向给候选打分，批量读取候选
+并以投机 `ZRAM_PREFETCHED` 条目的形式恢复到 zram。prefetch 不持有
+`ZRAM_UNDER_WB`；它会跳过已经被 writeback 或 batch-in 拥有的 slot，并在
+提交前再次校验 slot 快照。过期、失效、命中、过期命中、读错误、prepare
+错误、快照不匹配和分配失败都会通过 Crystal 诊断信息暴露。
+
 #### force swapout
 
 force swapout 是 memcg 或全局 best-effort 操作，用于将符合条件的页面写回 backing device。它可能部分成功，也可能因为无匹配页面、quota 用尽、压力检查、目标过滤或写回失败而提前结束。
@@ -157,6 +174,7 @@ force swapin 是 best-effort batch-in 操作。它选择目标设备和页面，
 | 自动写回策略 | 根据压力、zram 状态、quota、设备寿命控制和节流窗口决定是否写回页面。 |
 | force swapout | 允许从 memcg 或全局控制路径显式触发 best-effort 页面写回。 |
 | force swapin / batch-in | 允许将已写回页面通过快照校验读回 zram。 |
+| ZMS prefetch | 在 ZMS 读后投机恢复邻近 ZMS-backed slot，同时不阻塞正常 writeback 或 batch-in 所有权。 |
 | force shrink | 在平台支持时提供 memcg 级匿名页和文件页收缩控制。 |
 | per-memcg 策略与统计 | 暴露 cgroup 级压力、参数、操作结果和 per-app 摘要。 |
 | multi-zram 处理 | 多个 zram 设备同时存在时选择合适目标。 |
@@ -233,6 +251,8 @@ echo '...' > /sys/fs/cgroup/memory/<cg_path>/memory.swapd_single_memcg_param
 | `writeback_limit` | 设置写回限制。 |
 | `writeback_limit_enable` | 启用或关闭写回限制。 |
 | `bd_stat` | 保持标准 zram 三字段 backing-device 统计格式。 |
+| `zms_stat` | 显示 Crystal ZMS backing-store 状态、打包情况、block 分配、dirty 数据和 read-merge 诊断。 |
+| `writeback_cold_stat` | 显示启用 entry access-time tracking 时自动写回使用的 age/cold-page 选择计数。 |
 
 ### 4.4 Crystal zram bridge 节点
 
@@ -298,21 +318,30 @@ effective 条件来源。
 cat /sys/block/<zramX>/hybridswap_vmstat
 cat /sys/block/<zramX>/hybridswap_crystal_stat
 cat /sys/block/<zramX>/hybridswap_stat_snap
+cat /sys/block/<zramX>/zms_stat
+cat /sys/block/<zramX>/writeback_cold_stat
 cat /sys/kernel/debug/crystal_hybridswap/stats
 cat /sys/kernel/debug/crystal_hybridswap/report
 dmesg | grep -i hybridswap
 ```
 
-确认是否发生写回或 batch-in 时，可检查：
+确认是否发生写回、batch-in 或 prefetch 时，可检查：
 
 - `last_writeback_*` 字段；
 - `force_swapout_*` 字段；
 - `force_swapin_*` 字段；
 - `zram_bd_*` 字段；
 - `batchin_*` 字段；
+- `zram_prefetch_*` 字段；
+- `zms_stat` 和 `writeback_cold_stat`；
 - 压力原因字段；
 - debugfs 计数器；
 - 相关内核日志。
+
+`zram_prefetch_errors` 是兼容用聚合字段，只汇总 prefetch read、
+prepare 和 allocation failure 计数。快照不匹配通过
+`zram_prefetch_snapshot_mismatch` 单独显示，因为它是投机 prefetch 的预期
+竞态结果，不属于 I/O 或分配失败。
 
 ---
 
@@ -337,6 +366,8 @@ Crystal 专属接口分为：
 2. memcg bridge 节点：`memory.force_swapout`、`memory.force_swapin`、`memory.force_shrink_*`、`memory.swapd_*` 和 per-app 摘要节点。
 3. pressure eventfd 接口：注册并通知 low、medium、critical 压力等级。
 4. debugfs 接口：详细计数、快照和诊断报告。
+5. Crystal zram 诊断节点：`zms_stat` 和 `writeback_cold_stat`，它们位于
+   `/sys/block/zramX` 下，但属于 Crystal 私有扩展，不是标准 zram ABI 字段。
 
 ### 5.3 兼容占位 API 边界
 
@@ -374,6 +405,8 @@ Crystal 专属接口分为：
 
 - backing device 需要谨慎选择。Crystal Hybridswap 不会让不适合 swap 工作负载的存储设备变得安全。
 - force swapout 和 force swapin 都是 best-effort 操作。部分成功、无匹配页面、quota 用尽、压力过滤、快照不匹配和 I/O 失败都属于可能结果。
+- ZMS backing 元数据是易失内存状态。ZMS 写入的 backing block 只有在匹配的
+  zram/ZMS 元数据仍然存活时才有意义。
 - 标准 zram ABI 兼容性优先于标准节点扩展。Crystal 专属信息应放在 Crystal 扩展节点或 debugfs。
 - debugfs 面向开发和深度诊断，不应视为稳定生产 ABI。
 - 兼容占位 API 默认关闭，只应在用户态确实需要时启用。
@@ -418,16 +451,20 @@ Crystal 专属接口分为：
 - zram 压力低于配置阈值；
 - 策略处于空结果退避窗口；
 - daily quota 或窗口节流阻止操作；
+- 系统正在进入 suspend、hibernate 或 restore，ZMS writeback 被临时跳过；
+- ZMS 没有足够安全的空闲 backing-block 预算来执行下一批 writeback；
 - 没有可用 memcg 候选；
 - 选中的设备没有符合条件的页面。
 
-### 8.6 如何确认确实发生了写回或 batch-in？
+### 8.6 如何确认确实发生了写回、batch-in 或 prefetch？
 
 建议结合多类证据：
 
 - `hybridswap_vmstat` 查看最近操作摘要；
 - `hybridswap_crystal_stat` 查看累计计数；
 - `hybridswap_stat_snap` 查看最近操作快照；
+- `zms_stat` 查看 ZMS 打包、dirty block、分配和 read-merge 状态；
+- `writeback_cold_stat` 查看自动 cold-page 选择；
 - debugfs stats 查看详细计数；
 - 内核日志查看操作结果和压力消息。
 
@@ -442,6 +479,7 @@ Crystal 专属接口分为：
 | Kconfig | 保持功能符号、依赖、默认值和兼容选项清晰。 |
 | Makefile | 保持模块对象组成与启用功能一致。 |
 | zram driver | 保持标准 zram ABI、slot 状态正确性、压缩行为、写回、batch-in 和设备生命周期安全。 |
+| ZMS store | 维护 packed-object handle 生命周期、block pinning、dirty flushing、连续 backing I/O、读缓存和统计。 |
 | zram bridge | 保持 Crystal sysfs 控制、统计、报告和操作快照准确且便于阅读。 |
 | core worker | 维护异步工作顺序、自动策略、quota 记账、force 操作和 multi-zram 选择。 |
 | memcg interface | 维护 cgroup 控制语义、参数解析、force 操作和 per-memcg 统计。 |
@@ -455,14 +493,17 @@ Crystal 专属接口分为：
 
 1. zram 设备生命周期在 reset、移除和异步工作并发时必须安全。
 2. 页级 slot 状态只能在正确保护下修改。
-3. `ZRAM_UNDER_WB` 所有权必须清晰；writeback 或 batch-in 工作的所有者负责清理它。
-4. batch-in 提交恢复数据前必须校验 slot 快照。
-5. 自动策略必须遵守 pause、disable、teardown 和 reconfiguration 状态。
-6. 除非有意重设计队列模型，pending async work 应保持快照式语义。
-7. 统计字段应使用清晰单位，例如 pages、bytes、ns、ms、count 或 ratio。
-8. 标准 zram 节点必须保持兼容；Crystal 专属数据应放在 Crystal 扩展节点或 debugfs。
-9. 兼容占位 API 不应悄悄获得真实旧数据路径语义。
-10. 旧 `memory.swapd_memcgs_param` 策略行为必须始终受 `CONFIG_CRYSTAL_HYBRIDSWAP_LEGACY_SWAPD_MEMCGS_PARAM` 控制；关闭该选项时不得影响自动 memcg 写回。
+3. `ZRAM_UNDER_WB` 所有权必须清晰；writeback 或 batch-in 工作的所有者
+   负责清理它。Prefetch 不得占用这个所有权 bit。
+4. batch-in 和 prefetch 提交恢复数据前必须校验 slot 快照。
+5. 自动策略和 ZMS writeback 必须遵守 pause、disable、teardown、
+   reconfiguration 和 system-sleep 状态。
+6. ZMS handle 和 backing block 只有在对应内存元数据存在时才有效。
+7. 除非有意重设计队列模型，pending async work 应保持快照式语义。
+8. 统计字段应使用清晰单位，例如 pages、bytes、ns、ms、count 或 ratio。
+9. 标准 zram 节点必须保持兼容；Crystal 专属数据应放在 Crystal 扩展节点或 debugfs。
+10. 兼容占位 API 不应悄悄获得真实旧数据路径语义。
+11. 旧 `memory.swapd_memcgs_param` 策略行为必须始终受 `CONFIG_CRYSTAL_HYBRIDSWAP_LEGACY_SWAPD_MEMCGS_PARAM` 控制；关闭该选项时不得影响自动 memcg 写回。
 
 ### 9.3 维护建议
 
