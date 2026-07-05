@@ -3272,7 +3272,7 @@ static int __init crystal_hybridswap_init(void)
 	atomic_set(&chs.core_enabled, 0);
 	atomic_set(&chs.swapd_pause, 0);
 	atomic_set(&chs.dev_life, 0);
-	atomic_set(&chs.loglevel, CHS_LOG_MAX);
+	atomic_set(&chs.loglevel, CHS_LOG_DEBUG);
 	atomic_set(&chs.erm_avail_buffer_enable,
 		   CHS_ERM_AVAIL_BUFFER_DEFAULT_ENABLE);
 	atomic64_set(&chs.quota_day, CHS_DEFAULT_QUOTA_DAY);
