@@ -2390,7 +2390,7 @@ static char *custom_module_blacklist[] = {
 #if IS_BUILTIN(CONFIG_CRYPTO_LZO)
     "lzo", "lzo_rle", 
 #endif
-#if IS_BUILTIN(CONFIG_ZRAM)
+#if IS_BUILTIN(CONFIG_ZRAM) || IS_ENABLED(CONFIG_CRYSTAL_HYBRIDSWAP)
 	"oplus_bsp_hybridswap_zram", "oplus_bsp_zram_opt", 
 	"oplus_bsp_fg_protect", "oplus_exit_mm_optimize", 
 #endif
@@ -2985,11 +2985,7 @@ static int load_module(struct load_info *info, const char __user *uargs,
     
     if (blacklisted(info->name)) {
 		pr_err("Module %s is blacklisted\n", info->name);
-		goto free_copy;
-	}
-
-    if (blacklisted(info->name)) {
-		pr_err("Module %s is blacklisted\n", info->name);
+		err = -EPERM;
 		goto free_copy;
 	}
 

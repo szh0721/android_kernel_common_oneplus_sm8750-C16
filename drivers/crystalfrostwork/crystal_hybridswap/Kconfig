@@ -6,7 +6,7 @@ config CRYSTAL_HYBRIDSWAP
 	depends on ZRAM=n
 	depends on MEMCG
 	depends on CGROUPS
-	depends on CRYPTO_LZO || CRYPTO_LZ4 || CRYPTO_LZ4HC || CRYPTO_LZ4K || CRYPTO_LZ4KD || CRYPTO_DEFLATE || CRYPTO_842 || CRYPTO_ZSTD
+	depends on CRYPTO_LZO || CRYPTO_LZ4 || CRYPTO_LZ4HC || CRYPTO_LZ4K || CRYPTO_LZ4K_OPLUS || CRYPTO_LZ4KD || CRYPTO_DEFLATE || CRYPTO_842 || CRYPTO_ZSTD
 	select EVENTFD
 	select ZSMALLOC
 	select CRYSTAL_HYBRIDSWAP_ZRAM_WRITEBACK
@@ -112,6 +112,7 @@ config CRYSTAL_HYBRIDSWAP_ZRAM_MULTI_COMP
 config CRYSTAL_HYBRIDSWAP_ZRAM_DEF_COMP
 	string "Default Crystal Hybridswap zram compressor"
 	depends on CRYSTAL_HYBRIDSWAP
+	default "lz4k_oplus" if CRYPTO_LZ4K_OPLUS
 	default "lz4kd" if CRYPTO_LZ4KD
 	default "lz4" if CRYPTO_LZ4
 	default "lzo" if CRYPTO_LZO
@@ -125,5 +126,5 @@ config CRYSTAL_HYBRIDSWAP_ZRAM_DEF_COMP
 	  zram device before userspace changes /sys/block/zramX/comp_algorithm.
 	  The value is passed to the kernel crypto compression API, so it must
 	  name an algorithm supported by the current kernel/zcomp configuration,
-	  such as lzo, lzo-rle, lz4, lz4kd, or zstd when those backends are
+	  such as lzo, lzo-rle, lz4, lz4k_oplus, lz4kd, or zstd when those backends are
 	  enabled.
